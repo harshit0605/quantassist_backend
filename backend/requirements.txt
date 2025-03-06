@@ -8,3 +8,4 @@ schedule==1.2.2
 SQLAlchemy==2.0.31
 sqlmodel==0.0.23
 uvicorn==0.34.0
+psycopg2
