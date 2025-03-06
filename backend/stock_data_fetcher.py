@@ -7,9 +7,9 @@ import requests
 import datetime
 from contextlib import contextmanager
 from typing import Optional, List
-from sqlalchemy import Column, Date
 from pathlib import Path
 from dotenv import load_dotenv
+from collections import defaultdict
 
 from sqlmodel import (
     Field,
@@ -110,9 +110,9 @@ def db_engine_context():
             _db_engine = None
 
 class StockDataFetcher:
-    def __init__(self, api_key: str, db_session: Session, cache_dir: str = "stock_cache"):
+    def __init__(self, db_session: Session, cache_dir: str = "stock_cache"):
         logger.debug("Initializing StockDataFetcher.")
-        self.api_key = api_key
+        self.api_key = get_api_key("ALPHA_VANTAGE_API_KEY")
         self.base_url = "https://www.alphavantage.co/query"
         self.db_session = db_session
         self.cache_dir = cache_dir
@@ -284,39 +284,87 @@ class StockDataFetcher:
 
     def get_stock_data(self, symbol: str, days: int = 30):
         """
-        Get in-database stock data for a given symbol over N days, returning a list of dicts.
+        Get up to `days` days of stock data for `symbol` from the database,
+        returning a DataFrame (or empty DataFrame if none found).
         """
         logger.debug(f"Retrieving stock data for {symbol} over the past {days} days.")
-        cutoff_date = datetime.datetime.now() - datetime.timedelta(days=days)
+        cutoff_date = datetime.datetime.now().date() - datetime.timedelta(days=days)
+        logger.debug(f"Cutoff date: {cutoff_date}")
         query = (
             select(StockPrice)
             .where(StockPrice.symbol == symbol)
             .where(StockPrice.stock_date >= cutoff_date)
-            .order_by(StockPrice.stock_date)
+            .order_by(StockPrice.stock_date.asc())
         )
         stock_prices = self.db_session.exec(query).all()
 
+        if not stock_prices:
+            logger.debug(f"Retrieved 0 rows from DB for {symbol}.")
+            return pd.DataFrame()
+
         logger.debug(f"Retrieved {len(stock_prices)} rows from DB for {symbol}.")
 
-        return [
-            {
-                "symbol": row.symbol,
-                "date": row.stock_date.isoformat(),
-                "open": row.open,
-                "high": row.high,
-                "low": row.low,
-                "close": row.close,
-                "volume": row.volume,
-            }
-            for row in stock_prices
-        ]
+        data = []
+        for row in stock_prices:
+            data.append({
+                'symbol': row.symbol,
+                'date': row.stock_date.isoformat(),
+                'open': row.open,
+                'high': row.high,
+                'low': row.low,
+                'close': row.close,
+                'volume': row.volume
+            })
 
+        df = pd.DataFrame(data)
+        df.sort_values(by='date', inplace=True, ascending=True)
+        df.reset_index(drop=True, inplace=True)
+        return df
+
+    def get_all_stock_data(self, symbols, days=30):
+        """
+        Retrieves stock data for all requested symbols over the last N days.
+        Returns a dictionary keyed by symbol, with values as DataFrames.
+        """
+
+        cutoff_date = datetime.date.today() - datetime.timedelta(days=days)
+
+        # Fetch everything for the symbols in the date range
+        query = (
+            select(StockPrice)
+            .where(StockPrice.symbol.in_(symbols))
+            .where(StockPrice.stock_date >= cutoff_date)
+            .order_by(StockPrice.symbol, StockPrice.stock_date.asc())
+        )
+        results = self.db_session.exec(query).all()
+
+        # Group results by symbol
+        symbol_data_map = defaultdict(list)
+        for row in results:
+            symbol_data_map[row.symbol].append({
+                'symbol': row.symbol,
+                'date': row.stock_date,
+                'open': row.open,
+                'high': row.high,
+                'low': row.low,
+                'close': row.close,
+                'volume': row.volume
+            })
+
+        # Convert each list to a DataFrame, sorted ascending by date
+        for symbol in symbol_data_map:
+            df = pd.DataFrame(symbol_data_map[symbol]).sort_values(by='date')
+            df.reset_index(drop=True, inplace=True)
+            symbol_data_map[symbol] = df
+
+        return symbol_data_map
+    
 if __name__ == "__main__":
     API_KEY = get_api_key("ALPHA_VANTAGE_API_KEY")  # Replace with your API key
 
     with db_engine_context() as engine:
         session = init_db(engine)
-        fetcher = StockDataFetcher(API_KEY, session)
+        fetcher = StockDataFetcher(session)
 
         # Example usage: uncomment to update data for selected stocks
         stocks_list = ["AAPL", "MSFT", "GOOG", "AMZN"]

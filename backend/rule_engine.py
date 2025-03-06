@@ -1,6 +1,6 @@
 import pandas as pd
 from sqlmodel import Session, select
-from stock_data_fetcher import StockPrice, get_db_engine
+from stock_data_fetcher import StockDataFetcher, get_db_engine
 
 class Rule:
     def __init__(self, name, description):
@@ -149,10 +149,10 @@ class MACDRule(Rule):
         signal = macd.ewm(span=self.signal_period, adjust=False).mean()
         
         # Get current and previous values
-        curr_macd = macd.iloc[0]
-        prev_macd = macd.iloc[1]
-        curr_signal = signal.iloc[0]
-        prev_signal = signal.iloc[1]
+        curr_macd = macd.iloc[-1]
+        prev_macd = macd.iloc[-2]
+        curr_signal = signal.iloc[-1]
+        prev_signal = signal.iloc[-2]
         
         # Check for crossover
         if curr_macd > curr_signal and prev_macd <= prev_signal:
@@ -187,8 +187,8 @@ class BollingerBandsRule(Rule):
         df['lower'] = df['sma'] - (df['std'] * self.std_dev)
         
         # Current and previous day
-        curr = df.iloc[0]
-        prev = df.iloc[1]
+        curr = df.iloc[-1]
+        prev = df.iloc[-2]
         
         # Check for crossing lower band (buy signal)
         if prev['close'] <= prev['lower'] and curr['close'] > curr['lower']:
@@ -211,31 +211,26 @@ class VolumeBreakoutRule(Rule):
         self.price_change_pct = price_change_pct
     
     def evaluate(self, stock_data):
-        """
-        Returns:
-        1 for buy signal (volume spike with price increase)
-        0 for no signal
-        """
         if len(stock_data) < 11:
             return 0
         
-        # Current day
-        current_day = stock_data.iloc[0]
+        # Current day should be the last row
+        current_day = stock_data.iloc[-1]
         
-        # Calculate average volume (excluding current day)
-        avg_volume = stock_data.iloc[1:11]['volume'].mean()
+        # Calculate average volume over the 10 rows prior to current
+        avg_volume = stock_data.iloc[-11:-1]['volume'].mean()
         
-        # Calculate price change percentage
-        prev_close = stock_data.iloc[1]['close']
+        # The previous close is from the day before current
+        prev_close = stock_data.iloc[-2]['close']
+        
         current_close = current_day['close']
         price_change_pct = ((current_close - prev_close) / prev_close) * 100
         
-        # Check for volume breakout with price increase
-        if (current_day['volume'] > self.volume_factor * avg_volume and 
-            price_change_pct >= self.price_change_pct):
+        if (current_day['volume'] > self.volume_factor * avg_volume
+            and price_change_pct >= self.price_change_pct):
             return 1  # Buy signal
-        else:
-            return 0  # No signal
+        
+        return 0  # No signal
 
 
 class SupplyDemandZoneRule(Rule):
@@ -275,15 +270,15 @@ class SupplyDemandZoneRule(Rule):
             return 0
         
         # Get recent data for analysis
-        analysis_data = stock_data.iloc[:self.lookback]
+        analysis_data = stock_data.iloc[-self.lookback:]
         
+        current_price = stock_data.iloc[-1]['close']
         # Find swing highs and lows
         swing_highs, swing_lows = self.find_swing_highs_lows(analysis_data, self.zone_strength)
         
         if not swing_highs or not swing_lows:
             return 0
         
-        current_price = stock_data.iloc[0]['close']
         
         # Find nearest supply zone (swing high)
         nearest_supply = None
@@ -329,89 +324,128 @@ class FibonacciRetracementRule(Rule):
         self.retracement_level = retracement_level
     
     def evaluate(self, stock_data):
-        """
-        Returns:
-        1 for buy signal (price at fibonacci retracement level in uptrend)
-        0 for no signal
-        """
         if len(stock_data) < self.trend_length + 1:
             return 0
         
-        # Determine if we're in an uptrend by comparing current close to past closes
-        close_prices = stock_data['close'].iloc[:self.trend_length]
-        current_close = close_prices.iloc[0]
+        # Grab the last 'trend_length' close prices
+        close_prices = stock_data['close'].iloc[-self.trend_length:]
         
-        # Get high and low of the trend
+        # Current close is the very last row in that slice
+        current_close = close_prices.iloc[-1]
+        
+        # High and low of that “trend window”
         trend_high = close_prices.max()
         trend_low = close_prices.min()
         
-        # Calculate Fibonacci levels
         fib_range = trend_high - trend_low
         fib_level = trend_high - (fib_range * self.retracement_level)
         
-        # Check if we're in an uptrend (current close > 50% of closes in our window)
-        uptrend = (close_prices > close_prices.median()).sum() >= self.trend_length / 2
+        # Check if we’re in an uptrend
+        uptrend = (close_prices > close_prices.median()).sum() >= (self.trend_length / 2)
         
-        # Check if price is near our Fibonacci level
-        near_fib = abs(current_close - fib_level) / fib_level <= 0.01  # Within 1% of fib level
-        
+        # Check if current is near Fibonacci level
+        near_fib = abs(current_close - fib_level) / fib_level <= 0.01
         if uptrend and near_fib:
-            return 1  # Buy signal
-        else:
-            return 0  # No signal
+            return 1
+        return 0
         
 class StockRulesEngine:
     def __init__(self, db_session):
         self.db_session = db_session
+        self.stock_fetcher = StockDataFetcher(
+            db_session=self.db_session
+        )
         self.rules = []
         
     def add_rule(self, rule):
         """Add a rule to the engine"""
         self.rules.append(rule)
         
-    def get_stock_data(self, symbol, days=30):
-        """Get stock data for a specific symbol"""
-        query = (
-            select(StockPrice)
-            .where(StockPrice.symbol == symbol)
-            .order_by(StockPrice.stock_date.desc())
-            .limit(days)
-        )
-        stock_prices = self.db_session.exec(query).all()
+    # def get_stock_data(self, symbol, days=30):
+    #     """Get stock data for a specific symbol"""
+    #     query = (
+    #         select(StockPrice)
+    #         .where(StockPrice.symbol == symbol)
+    #         .order_by(StockPrice.stock_date.desc())
+    #         .limit(days)
+    #     )
+    #     stock_prices = self.db_session.exec(query).all()
 
-        if not stock_prices:
-            return pd.DataFrame()
+    #     if not stock_prices:
+    #         return pd.DataFrame()
         
-        data = []
-        for row in stock_prices:
-            data.append({
-                'symbol': row.symbol,
-                'date': row.stock_date,
-                'open': row.open,
-                'high': row.high,
-                'low': row.low,
-                'close': row.close,
-                'volume': row.volume
-            })
+    #     data = []
+    #     for row in stock_prices:
+    #         data.append({
+    #             'symbol': row.symbol,
+    #             'date': row.stock_date,
+    #             'open': row.open,
+    #             'high': row.high,
+    #             'low': row.low,
+    #             'close': row.close,
+    #             'volume': row.volume
+    #         })
 
-        df = pd.DataFrame(data)
-        stock_data = df.iloc[::-1].reset_index(drop=True) # Reverse the dataframe to ascending order
+    #     df = pd.DataFrame(data)
+    #     stock_data = df.iloc[::-1].reset_index(drop=True) # Reverse the dataframe to ascending order
         
-        return stock_data # return reversed dataframe
+    #     return stock_data # return reversed dataframe
         
-    def evaluate_rules(self, symbol, days_of_data=30):
-        """Evaluate all rules for a given stock"""
-        stock_data = self.get_stock_data(symbol, days_of_data)
+    # def evaluate_rules(self, symbol, days_of_data=30):
+    #     """Evaluate all rules for a given stock"""
+    #     stock_data = self.stock_fetcher.get_stock_data(symbol, days_of_data)
         
+    #     if stock_data.empty:
+    #         return {
+    #         "symbol": symbol,
+    #         "date": None,
+    #         "current_price": None,
+    #         "error": "No data available",
+    #         "signals": []
+    #     }
+            
+    #     results = []
+    #     for rule in self.rules:
+    #         try:
+    #             signal = rule.evaluate(stock_data)
+    #             results.append({
+    #                 "rule_name": rule.name,
+    #                 "description": rule.description,
+    #                 "signal": signal
+    #             })
+    #         except Exception as e:
+    #             results.append({
+    #                 "rule_name": rule.name,
+    #                 "description": rule.description,
+    #                 "error": str(e)
+    #             })
+        
+    #     return {
+    #         "symbol": symbol,
+    #         "date": stock_data.iloc[-1]['date'].isoformat() if not stock_data.empty else None,
+    #         "current_price": stock_data.iloc[-1]['close'] if not stock_data.empty else None,
+    #         "signals": results
+    #     }
+    
+   
+    def evaluate_rules_for_data(self, symbol, stock_data):
+        """
+        Evaluate all rules for the given `symbol` using the already-fetched 
+        `stock_data` DataFrame. (No DB calls here.)
+        """
+        import pandas as pd
+
         if stock_data.empty:
             return {
-            "symbol": symbol,
-            "date": None,
-            "current_price": None,
-            "error": "No data available",
-            "signals": []
-        }
-            
+                "symbol": symbol,
+                "date": None,
+                "current_price": None,
+                "error": "No data available",
+                "signals": []
+            }
+        print(f"Retrieved {len(stock_data)} rows of data for {symbol}")
+        print(f"Date range: {stock_data['date'].min()} to {stock_data['date'].max()}")
+
         results = []
         for rule in self.rules:
             try:
@@ -427,7 +461,7 @@ class StockRulesEngine:
                     "description": rule.description,
                     "error": str(e)
                 })
-        
+
         return {
             "symbol": symbol,
             "date": stock_data.iloc[-1]['date'].isoformat() if not stock_data.empty else None,
@@ -435,21 +469,75 @@ class StockRulesEngine:
             "signals": results
         }
     
-    def get_recommendations(self, symbols):
-        """Get recommendations for a list of stocks"""
-        recommendations = []
+    # def get_recommendations1(self, symbols):
+    #     """Get recommendations for a list of stocks"""
+    #     recommendations = []
         
+    #     for symbol in symbols:
+    #         result = self.evaluate_rules(symbol)
+    #         buy_signals = sum(1 for signal in result["signals"] if signal.get("signal") == 1)
+    #         sell_signals = sum(1 for signal in result["signals"] if signal.get("signal") == -1)
+
+    #         strength = buy_signals - sell_signals
+    #         recommendation = "STRONG BUY" if strength >= 2 else \
+    #                         "BUY" if strength == 1 else \
+    #                         "STRONG SELL" if strength <= -2 else \
+    #                         "SELL" if strength == -1 else "HOLD"
+            
+    #         recommendations.append({
+    #             "symbol": symbol,
+    #             "price": result["current_price"],
+    #             "date": result["date"],
+    #             "recommendation": recommendation,
+    #             "signals": result["signals"],
+    #             "strength": strength
+    #         })
+            
+    #     return recommendations
+
+    def get_recommendations(self, symbols, days):
+        """
+        Retrieves stock data for all symbols in one go, then 
+        evaluates the signals for each symbol, and produces recommendations.
+        """
+        # Fetch data once for all symbols
+        all_symbols_data = self.stock_fetcher.get_all_stock_data(symbols, days)
+        recommendations = []
+
+        print(f"Retrieved data for {len(all_symbols_data)} symbols")
+        for symbol, data in all_symbols_data.items():
+            if not data.empty:
+                print(f"{symbol}: {len(data)} rows, from {data['date'].min()} to {data['date'].max()}")
+            else:
+                print(f"{symbol}: No data")
+
         for symbol in symbols:
-            result = self.evaluate_rules(symbol)
+            # Either fetch the symbol's DataFrame or create an empty one
+            stock_data = all_symbols_data.get(symbol)
+            if stock_data is None or stock_data.empty:
+                # No data found for this symbol
+                recommendations.append({
+                    "symbol": symbol,
+                    "price": None,
+                    "date": None,
+                    "recommendation": "HOLD",
+                    "signals": [],
+                    "strength": 0
+                })
+                continue
+
+            # Evaluate rules with in-memory data
+            result = self.evaluate_rules_for_data(symbol, stock_data)
             buy_signals = sum(1 for signal in result["signals"] if signal.get("signal") == 1)
             sell_signals = sum(1 for signal in result["signals"] if signal.get("signal") == -1)
 
             strength = buy_signals - sell_signals
-            recommendation = "STRONG BUY" if strength >= 2 else \
-                            "BUY" if strength == 1 else \
-                            "STRONG SELL" if strength <= -2 else \
-                            "SELL" if strength == -1 else "HOLD"
-            
+            recommendation = ("STRONG BUY" if strength >= 2 else
+                              "BUY"       if strength == 1 else
+                              "STRONG SELL" if strength <= -2 else
+                              "SELL"      if strength == -1 else
+                              "HOLD")
+
             recommendations.append({
                 "symbol": symbol,
                 "price": result["current_price"],
@@ -458,9 +546,8 @@ class StockRulesEngine:
                 "signals": result["signals"],
                 "strength": strength
             })
-            
-        return recommendations
 
+        return recommendations
 # Example usage
 if __name__ == "__main__":
     engine = get_db_engine()
@@ -478,12 +565,18 @@ if __name__ == "__main__":
 
         # Get recommendations for stocks
         stocks = ["AAPL", "MSFT", "GOOG", "AMZN"]
-        recommendations = rules_engine.get_recommendations(stocks)
+        recommendations = rules_engine.get_recommendations(stocks, 60)
         
         for rec in recommendations:
-            print(
-                f"{rec['symbol']}: {rec['recommendation']} "
-                f"(Price: {rec['price']}) "
-                f"(Signals: {rec['signals']}) "
-                f"(Strength: {rec['strength']})"
-            )
+            print(f"\n{rec['symbol']}: {rec['recommendation']} (Price: {rec['price']}) (Strength: {rec['strength']})")
+            print("Individual signals:")
+            for signal in rec['signals']:
+                print(f"  - {signal['rule_name']}: {signal['signal']}")
+        # for rec in recommendations:
+            # print(
+            #     # f"{rec['symbol']}: {rec['recommendation']} "
+            #     # f"(Price: {rec['price']}) "
+            #     f"(Signals: {rec['signals']}) "
+            #     f"(Strength: {rec['strength']})"
+            # )
+            

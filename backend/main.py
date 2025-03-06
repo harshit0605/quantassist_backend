@@ -110,7 +110,7 @@ def update_stocks(request: StockList, background_tasks: BackgroundTasks, db: Ses
     jobs_registry[job_id] = {"status": "pending", "symbols": request.symbols, "results": {}}
 
     def fetch_data(symbols, job_id):
-        fetcher = StockDataFetcher(os.environ.get("ALPHA_VANTAGE_API_KEY", "demo"), db)
+        fetcher = StockDataFetcher(db)
         jobs_registry[job_id]["status"] = "in_progress"
         results = fetcher.update_stocks(symbols)
         jobs_registry[job_id]["results"] = results
@@ -127,23 +127,24 @@ def get_stock_data(symbol: str, days: int = 30, db: Session = Depends(get_db)):
     """
     Get historical stock data for a symbol
     """
-    fetcher = StockDataFetcher(os.environ.get("ALPHA_VANTAGE_API_KEY", "demo"), db)
-    data = fetcher.get_stock_data(symbol, days)
+    fetcher = StockDataFetcher(db)
+    df = fetcher.get_stock_data(symbol, days)
 
-    if not data:
+    if df.empty:
         # No data found in DB -> attempt to update
         update_result = fetcher.update_stocks([symbol])
         # Re-fetch after update attempt
-        data = fetcher.get_stock_data(symbol, days)
+        df = fetcher.get_stock_data(symbol, days)
 
         # If still no data, raise 404
-        if not data:
+        if df.empty:
             raise HTTPException(status_code=404, detail=f"No data found for {symbol}")
-
-    return data
+        
+    data_list = df.to_dict(orient="records")
+    return data_list
 
 @app.get("/recommendations", response_model=List[Recommendation])
-def get_recommendations(symbols: str, db: Session = Depends(get_db)):
+def get_recommendations(symbols: str, days: int = 30, db: Session = Depends(get_db)):
     """
     Get recommendations for a comma-separated list of stock symbols
     """
@@ -152,7 +153,7 @@ def get_recommendations(symbols: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="No symbols provided")
 
     engine = get_rules_engine(db)
-    recommendations = engine.get_recommendations(symbol_list)
+    recommendations = engine.get_recommendations(symbol_list, days)
     return recommendations
 
 @app.get("/jobs/{job_id}")
